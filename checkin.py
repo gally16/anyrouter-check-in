@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AnyRouter.top 自动签到脚本 (增强版 - 模拟点击模式)
+AnyRouter.top 自动签到脚本 (Playwright 网络拦截版)
 """
 
 import asyncio
@@ -24,7 +24,6 @@ BALANCE_HASH_FILE = 'balance_hash.txt'
 
 
 def load_balance_hash():
-    """加载余额hash"""
     try:
         if os.path.exists(BALANCE_HASH_FILE):
             with open(BALANCE_HASH_FILE, 'r', encoding='utf-8') as f:
@@ -35,7 +34,6 @@ def load_balance_hash():
 
 
 def save_balance_hash(balance_hash):
-    """保存余额hash"""
     try:
         with open(BALANCE_HASH_FILE, 'w', encoding='utf-8') as f:
             f.write(balance_hash)
@@ -44,17 +42,14 @@ def save_balance_hash(balance_hash):
 
 
 def generate_balance_hash(balances):
-    """生成余额数据的hash"""
     simple_balances = {k: v['quota'] for k, v in balances.items()} if balances else {}
     balance_json = json.dumps(simple_balances, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
 
 
 def parse_cookies(cookies_data):
-    """解析 cookies 数据"""
     if isinstance(cookies_data, dict):
         return cookies_data
-
     if isinstance(cookies_data, str):
         cookies_dict = {}
         for cookie in cookies_data.split(';'):
@@ -66,7 +61,6 @@ def parse_cookies(cookies_data):
 
 
 def get_domain_from_url(url):
-    """从URL中提取域名"""
     parsed = urlparse(url)
     return parsed.netloc
 
@@ -74,18 +68,15 @@ def get_domain_from_url(url):
 async def run_playwright_checkin(account_name: str, provider_config, cookies: dict) -> bool:
     """
     使用 Playwright 进行可视化模拟点击签到
-    解决页面延迟加载和动态按钮的问题
+    并拦截网络请求以验证是否真正成功
     """
-    print(f'[BROWSER] {account_name}: Starting browser automation for check-in...')
+    print(f'[BROWSER] {account_name}: Starting browser automation...')
 
-    # 目标页面：通常是个人中心
     target_url = f'{provider_config.domain}/console/personal'
     domain = get_domain_from_url(provider_config.domain)
 
     async with async_playwright() as p:
         try:
-            # 启动浏览器
-            # headless=True 必须用于 GitHub Actions
             browser = await p.chromium.launch(
                 headless=True,
                 args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
@@ -93,21 +84,13 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
 
             context = await browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                viewport={'width': 1920, 'height': 1080},
-                device_scale_factor=1,
+                viewport={'width': 1920, 'height': 1080}
             )
 
-            # 转换 Cookies 格式
+            # 注入 Cookies
             pw_cookies = []
             for name, value in cookies.items():
-                pw_cookies.append({
-                    'name': name,
-                    'value': value,
-                    'domain': domain,
-                    'path': '/'
-                })
-            
-            # 注入 Cookies
+                pw_cookies.append({'name': name, 'value': value, 'domain': domain, 'path': '/'})
             await context.add_cookies(pw_cookies)
             
             page = await context.new_page()
@@ -116,111 +99,128 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
             try:
                 await page.goto(target_url, timeout=60000, wait_until='domcontentloaded')
             except Exception as e:
-                print(f'[WARN] {account_name}: Page load timeout, but continuing check... ({str(e)[:50]})')
+                print(f'[WARN] {account_name}: Page load warning: {str(e)[:50]}')
 
-            # --- 关键修改：处理延迟加载 ---
-            print(f'[BROWSER] {account_name}: Waiting for page to stabilize...')
+            # 等待网络空闲
             try:
-                await page.wait_for_load_state('networkidle', timeout=15000)
+                await page.wait_for_load_state('networkidle', timeout=10000)
             except:
                 pass
             
-            # 强制等待 5 秒，确保动态 JS 执行完毕 (针对 duckcoding 等慢加载站点)
-            await page.wait_for_timeout(5000)
-
-            # --- 检查是否已经签到 ---
-            # 检查页面上是否存在指示“已签到”的文本
-            content = await page.content()
-            if "已签到" in content or "今日已签" in content or "Signed in" in content:
-                print(f'[SUCCESS] {account_name}: Detected "Already Signed In" status.')
-                await browser.close()
-                return True
-
-            # --- 寻找并点击按钮 ---
-            # 定义可能的按钮文本
-            button_texts = ["立即签到", "签到", "打卡", "Sign In", "Check in"]
-            clicked = False
-
-            for btn_text in button_texts:
-                # 查找可见的按钮或链接
-                locator = page.get_by_text(btn_text, exact=True)
-                
-                # 如果找不到精确匹配，尝试包含匹配
-                if await locator.count() == 0:
-                     locator = page.get_by_text(btn_text)
-
-                # 确保元素可见且可点击
-                if await locator.count() > 0:
-                    # 遍历找到的元素，点击第一个可见的
-                    count = await locator.count()
-                    for i in range(count):
-                        element = locator.nth(i)
-                        if await element.is_visible():
-                            print(f'[ACTION] {account_name}: Found button "{btn_text}", clicking...')
-                            try:
-                                await element.click(timeout=5000)
-                                clicked = True
-                                break
-                            except:
-                                continue
-                    if clicked:
-                        break
+            # --- 关键调试：检查当前 URL ---
+            current_url = page.url
+            print(f'[DEBUG] {account_name}: Current URL is {current_url}')
             
-            # 如果文本没找到，尝试查找带 icon 的按钮 (适配某些主题)
-            if not clicked:
-                try:
-                    icon_btn = page.locator('.ui.button').filter(has_text="签到")
-                    if await icon_btn.count() > 0 and await icon_btn.first.is_visible():
-                        print(f'[ACTION] {account_name}: Found button via CSS selector, clicking...')
-                        await icon_btn.first.click()
-                        clicked = True
-                except:
-                    pass
-
-            if not clicked:
-                print(f'[FAILED] {account_name}: Could not find any check-in button on the page.')
-                # 调试时可以取消注释下面这行来查看页面内容
-                # print(await page.content())
+            if "/login" in current_url:
+                print(f'[FAILED] {account_name}: Redirected to login page. Cookies likely invalid or expired.')
                 await browser.close()
                 return False
 
-            # --- 验证点击结果 ---
-            await page.wait_for_timeout(3000) # 点击后等待响应
+            # --- 检查是否已签到 ---
+            # 有些站点显示“已签到”，有些是按钮变成灰色
+            content = await page.content()
+            if "已签到" in content or "今日已签" in content:
+                print(f'[SUCCESS] {account_name}: Status is "Already Signed In".')
+                await browser.close()
+                return True
 
-            # 再次检查页面内容
-            content_after = await page.content()
-            success_keywords = ["已签到", "成功", "Success", "获得", "received"]
+            # --- 定位按钮 ---
+            # 策略：优先找 ID，其次找特定文本的 Button
+            # 很多 OneAPI 主题的签到按钮 ID 是 'checkin' 或者 class 包含 checkin
             
-            is_success = False
-            for keyword in success_keywords:
-                if keyword in content_after:
-                    is_success = True
-                    break
-            
-            if is_success:
-                print(f'[SUCCESS] {account_name}: Check-in action completed successfully!')
-            else:
-                # 有时候点击了但没有弹窗提示，只要没报错，我们暂且认为是成功的，或者已经被签过了
-                print(f'[INFO] {account_name}: Button clicked. Assuming success (no error detected).')
-                is_success = True
+            possible_selectors = [
+                "text=立即签到",
+                "text=每日签到",
+                "button:has-text('签到')", # 避免匹配到导航栏的纯文本
+                "a.button:has-text('签到')",
+                "#checkin", # 常见 ID
+                "text=Check in", # 英文
+                "text=打卡"
+            ]
 
+            target_button = None
+            for selector in possible_selectors:
+                locator = page.locator(selector)
+                count = await locator.count()
+                if count > 0:
+                    # 过滤掉不可见的元素
+                    for i in range(count):
+                        if await locator.nth(i).is_visible():
+                            target_button = locator.nth(i)
+                            print(f'[ACTION] {account_name}: Found button using selector "{selector}"')
+                            break
+                    if target_button:
+                        break
+            
+            if not target_button:
+                print(f'[FAILED] {account_name}: Could not find any valid check-in button.')
+                # 打印一下页面标题，确认是不是跑到别的页面了
+                print(f'[DEBUG] Page title: {await page.title()}')
+                await browser.close()
+                return False
+
+            # --- 核心逻辑：点击并监听 API 请求 ---
+            # 当点击按钮时，监听是否有发往 /api/user/checkin 的请求
+            print(f'[ACTION] {account_name}: Clicking button and waiting for API response...')
+            
+            # 设置一个标志位
+            request_triggered = False
+            checkin_success = False
+            
+            async with page.expect_response(
+                lambda response: "checkin" in response.url and response.request.method == "POST",
+                timeout=8000
+            ) as response_info:
+                try:
+                    await target_button.click()
+                    request_triggered = True
+                except Exception as e:
+                    print(f'[ERROR] Click failed: {e}')
+
+            if request_triggered:
+                try:
+                    response = await response_info.value
+                    status = response.status
+                    print(f'[NETWORK] {account_name}: API Response Status: {status}')
+                    
+                    if status == 200:
+                        try:
+                            res_json = await response.json()
+                            print(f'[NETWORK] {account_name}: Response Body: {json.dumps(res_json, ensure_ascii=False)}')
+                            
+                            # 判定逻辑：API 返回成功，或者提示已经签到
+                            if res_json.get('success') or res_json.get('data') is True:
+                                checkin_success = True
+                            elif "已签到" in str(res_json):
+                                checkin_success = True
+                            else:
+                                msg = res_json.get('message', res_json.get('msg', 'Unknown'))
+                                print(f'[FAILED] {account_name}: API returned error: {msg}')
+                        except:
+                            # 某些站点可能不返回 JSON，只返回 200 OK
+                            checkin_success = True
+                    else:
+                        print(f'[FAILED] {account_name}: API returned non-200 status.')
+                except Exception as e:
+                     print(f'[WARN] {account_name}: Timeout waiting for API response, but button was clicked. ({e})')
+                     # 如果超时，回退到检查页面文本
+                     await page.wait_for_timeout(2000)
+                     content_after = await page.content()
+                     if "已签到" in content_after or "成功" in content_after:
+                         checkin_success = True
+            
             await browser.close()
-            return is_success
+            
+            if checkin_success:
+                print(f'[SUCCESS] {account_name}: Check-in verified via Network/UI.')
+                return True
+            else:
+                print(f'[FAILED] {account_name}: Check-in failed (No success signal).')
+                return False
 
         except Exception as e:
-            print(f'[ERROR] {account_name}: Playwright execution failed: {e}')
+            print(f'[ERROR] {account_name}: Playwright unexpected error: {e}')
             return False
-
-
-async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
-    """准备请求所需的 cookies"""
-    # 这里我们简化逻辑：如果使用浏览器签到，WAF cookie 会在浏览器会话中自动处理
-    # 但为了后续的 API 余额查询，如果配置了需要 WAF，我们还是可以尝试获取一下
-    # 或者简单地直接返回用户 cookies，让后续 API 调用尝试
-    
-    # 鉴于 run_playwright_checkin 是全新的浏览器会话，WAF 预获取不是点击签到的必须步骤
-    # 只需要返回 user_cookies 即可，浏览器会自动处理 WAF
-    return user_cookies
 
 
 def get_user_info(client, headers, user_info_url: str):
@@ -232,7 +232,6 @@ def get_user_info(client, headers, user_info_url: str):
             data = response.json()
             if data.get('success'):
                 user_data = data.get('data', {})
-                # 注意：有些站点单位不同，这里保持你原脚本的逻辑 / 500000
                 quota = round(user_data.get('quota', 0) / 500000, 2)
                 used_quota = round(user_data.get('used_quota', 0) / 500000, 2)
                 return {
@@ -253,29 +252,24 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
     provider_config = app_config.get_provider(account.provider)
     if not provider_config:
-        print(f'[FAILED] {account_name}: Provider "{account.provider}" not found in configuration')
+        print(f'[FAILED] {account_name}: Provider "{account.provider}" not found')
         return False, None
 
-    print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
+    print(f'[INFO] {account_name}: Using provider "{account.provider}"')
 
     user_cookies = parse_cookies(account.cookies)
-    if not user_cookies:
-        print(f'[FAILED] {account_name}: Invalid configuration format')
-        return False, None
-
-    # 1. 执行浏览器模拟签到 (核心修改)
+    
+    # 1. 执行浏览器模拟签到
     check_in_result = await run_playwright_checkin(account_name, provider_config, user_cookies)
 
-    # 2. 查询余额 (使用 HTTP 请求，因为只需读取 JSON)
-    # 注意：如果站点有严格的 WAF，这里的 API 请求可能会失败，但前面的签到已经完成了
+    # 2. 查询余额 (仅用于展示)
     user_info = None
     try:
         client = httpx.Client(http2=True, timeout=30.0)
-        client.cookies.update(user_cookies) # API 查询使用原始 Cookie
+        client.cookies.update(user_cookies) 
 
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
             'Referer': provider_config.domain,
             provider_config.api_user_key: account.api_user,
         }
@@ -285,33 +279,28 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
         
         if user_info and user_info.get('success'):
             print(user_info['display'])
-        elif user_info:
-            print(f"[WARN] Balance check info: {user_info.get('error')}")
-
+        
         client.close()
     except Exception as e:
-        print(f'[WARN] {account_name}: Failed to fetch balance info (Check-in might still be successful): {e}')
+        print(f'[WARN] {account_name}: Failed to fetch balance info: {e}')
 
     return check_in_result, user_info
 
 
 async def main():
-    """主函数"""
-    print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (Browser Click Mode)')
+    print('[SYSTEM] AnyRouter.top Auto Check-in (Network Intercept Mode)')
     print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
     app_config = AppConfig.load_from_env()
-    print(f'[INFO] Loaded {len(app_config.providers)} provider configuration(s)')
-
     accounts = load_accounts_config()
+    
     if not accounts:
-        print('[FAILED] Unable to load account configuration, program exits')
+        print('[FAILED] No accounts found.')
         sys.exit(1)
 
-    print(f'[INFO] Found {len(accounts)} account configurations')
+    print(f'[INFO] Found {len(accounts)} accounts.')
 
     last_balance_hash = load_balance_hash()
-
     success_count = 0
     total_count = len(accounts)
     notification_content = []
@@ -326,85 +315,55 @@ async def main():
             
             if success:
                 success_count += 1
-            
-            # 记录用于通知的余额信息
-            if user_info and user_info.get('success'):
-                current_quota = user_info['quota']
-                current_used = user_info['used_quota']
-                current_balances[account_key] = {'quota': current_quota, 'used': current_used}
-
-            # 仅当失败时添加到通知列表 (余额变化在后面统一处理)
-            if not success:
+            else:
                 need_notify = True
                 account_name = account.get_display_name(i)
-                print(f'[NOTIFY] {account_name} check-in failed')
-                notification_content.append(f'[FAIL] {account_name} Check-in failed')
+                notification_content.append(f'[FAIL] {account_name}: Check-in verification failed')
+
+            if user_info and user_info.get('success'):
+                current_balances[account_key] = {'quota': user_info['quota'], 'used': user_info['used_quota']}
 
         except Exception as e:
-            account_name = account.get_display_name(i)
-            print(f'[FAILED] {account_name} processing exception: {e}')
             need_notify = True
-            notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+            print(f'[ERROR] Account {i+1} exception: {e}')
+            notification_content.append(f'[ERROR] Account {i+1}: {str(e)[:50]}')
 
-    # 检查余额变化
+    # 余额变动检测
     current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
-    
     if current_balance_hash:
-        if last_balance_hash is None:
+        if last_balance_hash is None or current_balance_hash != last_balance_hash:
             balance_changed = True
             need_notify = True
-            print('[NOTIFY] First run, saving balance hash')
-        elif current_balance_hash != last_balance_hash:
-            balance_changed = True
-            need_notify = True
-            print('[NOTIFY] Balance changes detected')
-        else:
-            print('[INFO] No balance changes detected')
+            print('[NOTIFY] Balance change detected')
+        
+    if current_balance_hash:
+        save_balance_hash(current_balance_hash)
 
-    # 如果有余额变化，把所有能获取到余额的账号信息都放入通知
+    # 汇总通知
     if balance_changed:
         for i, account in enumerate(accounts):
             account_key = f'account_{i + 1}'
             if account_key in current_balances:
                 account_name = account.get_display_name(i)
-                info = f'[BALANCE] {account_name}\n:money: Balance: ${current_balances[account_key]["quota"]}, Used: ${current_balances[account_key]["used"]}'
+                info = f'[BALANCE] {account_name}\n💰 Balance: ${current_balances[account_key]["quota"]}, Used: ${current_balances[account_key]["used"]}'
                 notification_content.append(info)
 
-    # 保存新的 hash
-    if current_balance_hash:
-        save_balance_hash(current_balance_hash)
-
-    # 发送通知
     if need_notify and notification_content:
-        summary = [
-            f'[STATS] Success: {success_count}/{total_count}',
-            f'[TIME] {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
-        ]
-        
-        full_msg = '\n\n'.join(summary + notification_content)
-        print("--- Notification Content ---")
-        print(full_msg)
-        print("----------------------------")
-        
-        notify.push_message('AnyRouter Check-in Alert', full_msg, msg_type='text')
-    else:
-        print('[INFO] All good, no notification sent.')
-
+        summary = f'[STATS] Success: {success_count}/{total_count}\n[TIME] {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+        full_msg = '\n\n'.join([summary] + notification_content)
+        print("--- Sending Notification ---")
+        notify.push_message('AnyRouter Check-in Report', full_msg, msg_type='text')
+    
     sys.exit(0 if success_count > 0 else 1)
 
 
 def run_main():
-    """运行主函数的包装函数"""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print('\n[WARNING] Program interrupted by user')
         sys.exit(1)
     except Exception as e:
-        print(f'\n[FAILED] Error occurred during program execution: {e}')
-        # 打印详细堆栈以便 Action 调试
-        import traceback
-        traceback.print_exc()
+        print(f'[FATAL] {e}')
         sys.exit(1)
 
 
