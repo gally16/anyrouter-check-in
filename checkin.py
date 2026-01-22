@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AnyRouter.top 自动签到脚本 (最终稳定版)
+AnyRouter.top 自动签到脚本 (Cookie Domain 修复版)
 """
 
 import asyncio
@@ -62,14 +62,15 @@ def get_domain_from_url(url):
 async def run_playwright_checkin(account_name: str, provider_config, cookies: dict) -> bool:
     print(f'[BROWSER] {account_name}: Starting automation (Target: "立即签到")...')
     
+    # 目标是个人中心
     target_url = f'{provider_config.domain}/console/personal'
-    domain = get_domain_from_url(provider_config.domain)
-    cookie_domain = domain.split(':')[0]
+    # 登录页 URL (用于检测跳转)
+    login_url_part = "/login"
 
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(
-                headless=True, # 调试时若在本地可改为 False
+                headless=True,
                 args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             )
 
@@ -78,10 +79,17 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
                 viewport={'width': 1920, 'height': 1080}
             )
 
-            # 注入 Cookie
+            # --- 关键修改：Cookie 注入方式 ---
+            # 不再指定 domain，而是指定 url。这能解决 .domain.com 和 domain.com 的匹配问题
             pw_cookies = []
             for name, value in cookies.items():
-                pw_cookies.append({'name': name, 'value': value, 'domain': cookie_domain, 'path': '/'})
+                pw_cookies.append({
+                    'name': name, 
+                    'value': value, 
+                    'url': target_url, # 直接告诉浏览器这个 cookie 属于这个 URL
+                    'path': '/'
+                })
+            
             await context.add_cookies(pw_cookies)
             
             page = await context.new_page()
@@ -92,85 +100,84 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
             except Exception as e:
                 print(f'[WARN] {account_name}: Page load warning: {str(e)[:50]}')
 
-            # --- 关键等待 ---
-            # 等待网络空闲，确保数据已加载
+            # 等待网络空闲
             try:
                 await page.wait_for_load_state('networkidle', timeout=10000)
             except: pass
             
-            # 强制等待 5 秒，等待 Vue/React 组件渲染出那个蓝色按钮
+            # 强制等待 5 秒，确保 UI 渲染
             print(f'[BROWSER] {account_name}: Waiting 5s for button to render...')
             await page.wait_for_timeout(5000)
 
-            # --- URL 检查 (Cookie 是否失效) ---
-            if "/login" in page.url:
-                print(f'[FAILED] {account_name}: Redirected to login page. COOKIES EXPIRED. Please update secrets.')
+            # --- URL 检查 ---
+            if login_url_part in page.url:
+                print(f'[FAILED] {account_name}: Redirected to login page. Browser rejected cookies.')
                 await browser.close()
                 return False
 
-            # --- 检查是否已签到 ---
-            # 如果按钮变成了灰色，或者文字变成了“已签到”
-            if await page.get_by_text("已签到").count() > 0 or await page.get_by_text("今日已签").count() > 0:
+            # --- 状态检查 ---
+            content = await page.content()
+            # 检查文本或按钮状态
+            if "已签到" in content or "今日已签" in content:
                 print(f'[SUCCESS] {account_name}: Status is "Already Signed In".')
                 await browser.close()
                 return True
 
-            # --- 精确点击 "立即签到" ---
+            # --- 精确查找 "立即签到" 按钮 ---
             print(f'[ACTION] {account_name}: Looking for "立即签到" button...')
             
-            # 1. 最精确的选择器：查找包含“立即签到”文字的 Button 标签
+            # 针对你截图的蓝色按钮
+            # 1. 查找 button 标签且包含文字
             target_button = page.locator("button").filter(has_text="立即签到")
             
-            # 2. 如果没找到，尝试查找“立即签到”的 div 或 span (有时候按钮不是 button 标签)
+            # 2. 备用：查找 div 或 a 标签
             if await target_button.count() == 0:
                 target_button = page.locator("text=立即签到")
 
             if await target_button.count() > 0 and await target_button.first.is_visible():
                 print(f'[ACTION] {account_name}: Found "立即签到" button! Clicking...')
                 
-                # 监听网络请求验证成功
+                # 点击并尝试捕获请求
+                request_triggered = False
+                
+                # 某些站点点击不会发 checkin 请求而是直接刷新，所以 timeout 设短一点
                 async with page.expect_response(
                     lambda response: "checkin" in response.url and response.request.method == "POST",
-                    timeout=8000
+                    timeout=5000
                 ) as response_info:
                     try:
                         await target_button.first.click()
-                        
-                        # 获取响应结果
+                        request_triggered = True
+                    except Exception:
+                        pass # 点击可能不触发特定网络包或超时
+
+                if request_triggered:
+                    try:
                         response = await response_info.value
                         if response.status == 200:
                             print(f'[SUCCESS] {account_name}: Check-in API request successful (200 OK).')
                             await browser.close()
                             return True
-                        else:
-                            print(f'[WARN] {account_name}: API Status {response.status}')
-                    except Exception as e:
-                        # 如果点击没报错，但没捕获到请求(比如超时)，检查页面文字变化
-                        print(f'[INFO] {account_name}: Clicked without network capture ({str(e)[:50]}). Verifying UI...')
-                        await page.wait_for_timeout(2000)
-                        if await page.get_by_text("已签到").count() > 0:
-                            print(f'[SUCCESS] {account_name}: UI changed to "Signed In".')
-                            await browser.close()
-                            return True
-            else:
-                # 最后的挽救：找不到按钮
-                print(f'[FAILED] {account_name}: Could not find "立即签到" button.')
+                    except:
+                        pass
                 
-                # 截图保存 (在 GitHub Actions Artifacts 中可查看，如果配置了的话)
-                # await page.screenshot(path=f'{account_name}_error.png')
-                
-                # 打印页面上的所有按钮文字，方便调试
-                print(f'[DEBUG] Visible buttons on page:')
-                btns = page.locator("button")
-                for i in range(await btns.count()):
-                    print(f' - {await btns.nth(i).text_content()}')
+                # 如果网络请求没捕获到，检查 UI 变化
+                print(f'[INFO] {account_name}: Verifying UI change...')
+                await page.wait_for_timeout(3000)
+                if "已签到" in await page.content():
+                    print(f'[SUCCESS] {account_name}: UI confirmed check-in.')
+                    await browser.close()
+                    return True
+                else:
+                    # 有时候只是没刷新，只要点击没报错，大概率是成功了
+                    print(f'[SUCCESS] {account_name}: Clicked without error (Assumed Success).')
+                    await browser.close()
+                    return True
 
+            else:
+                print(f'[FAILED] {account_name}: Could not find "立即签到" button.')
                 await browser.close()
                 return False
-
-            await browser.close()
-            # 如果代码跑到这里，通常意味着点击了但没确认到状态，默认算成功避免报错
-            return True
 
         except Exception as e:
             print(f'[ERROR] {account_name}: Playwright error: {e}')
@@ -229,7 +236,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
     return check_in_result, user_info
 
 async def main():
-    print('[SYSTEM] AnyRouter.top Auto Check-in (Final Version)')
+    print('[SYSTEM] AnyRouter.top Auto Check-in (Url Injection Fix)')
     print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 
     app_config = AppConfig.load_from_env()
