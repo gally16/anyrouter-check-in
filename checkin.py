@@ -62,10 +62,13 @@ def get_domain_from_url(url):
 async def run_playwright_checkin(account_name: str, provider_config, cookies: dict) -> bool:
     print(f'[BROWSER] {account_name}: Starting automation (Target: "立即签到")...')
     
-    # 目标是个人中心
+    # 目标页面
     target_url = f'{provider_config.domain}/console/personal'
-    # 登录页 URL (用于检测跳转)
-    login_url_part = "/login"
+    
+    # 解析根域名 URL，用于注册 Cookie (确保 Cookie 路径为 /)
+    # 例如: https://duckcoding.com/console/personal -> https://duckcoding.com
+    parsed_uri = urlparse(provider_config.domain)
+    root_url = f"{parsed_uri.scheme}://{parsed_uri.netloc}"
 
     async with async_playwright() as p:
         try:
@@ -79,15 +82,13 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
                 viewport={'width': 1920, 'height': 1080}
             )
 
-            # --- 关键修改：Cookie 注入方式 ---
-            # 不再指定 domain，而是指定 url。这能解决 .domain.com 和 domain.com 的匹配问题
+            # --- 关键修复：Cookie 注入 ---
             pw_cookies = []
             for name, value in cookies.items():
                 pw_cookies.append({
                     'name': name, 
                     'value': value, 
-                    'url': target_url, # 直接告诉浏览器这个 cookie 属于这个 URL
-                    'path': '/'
+                    'url': root_url  # 使用根 URL，不指定 path，让 Playwright 自动设为全站生效
                 })
             
             await context.add_cookies(pw_cookies)
@@ -110,14 +111,16 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
             await page.wait_for_timeout(5000)
 
             # --- URL 检查 ---
-            if login_url_part in page.url:
-                print(f'[FAILED] {account_name}: Redirected to login page. Browser rejected cookies.')
+            if "/login" in page.url:
+                print(f'[FAILED] {account_name}: Redirected to login page. Cookie failed to apply.')
+                # 打印一下当前的 Cookie 状态以便调试
+                # current_cookies = await context.cookies()
+                # print(f'[DEBUG] Cookies in browser: {len(current_cookies)}')
                 await browser.close()
                 return False
 
             # --- 状态检查 ---
             content = await page.content()
-            # 检查文本或按钮状态
             if "已签到" in content or "今日已签" in content:
                 print(f'[SUCCESS] {account_name}: Status is "Already Signed In".')
                 await browser.close()
@@ -126,7 +129,6 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
             # --- 精确查找 "立即签到" 按钮 ---
             print(f'[ACTION] {account_name}: Looking for "立即签到" button...')
             
-            # 针对你截图的蓝色按钮
             # 1. 查找 button 标签且包含文字
             target_button = page.locator("button").filter(has_text="立即签到")
             
@@ -140,7 +142,6 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
                 # 点击并尝试捕获请求
                 request_triggered = False
                 
-                # 某些站点点击不会发 checkin 请求而是直接刷新，所以 timeout 设短一点
                 async with page.expect_response(
                     lambda response: "checkin" in response.url and response.request.method == "POST",
                     timeout=5000
@@ -149,7 +150,7 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
                         await target_button.first.click()
                         request_triggered = True
                     except Exception:
-                        pass # 点击可能不触发特定网络包或超时
+                        pass 
 
                 if request_triggered:
                     try:
@@ -169,13 +170,21 @@ async def run_playwright_checkin(account_name: str, provider_config, cookies: di
                     await browser.close()
                     return True
                 else:
-                    # 有时候只是没刷新，只要点击没报错，大概率是成功了
-                    print(f'[SUCCESS] {account_name}: Clicked without error (Assumed Success).')
+                    # 只要没报错，且没跳转，通常是成功的
+                    print(f'[SUCCESS] {account_name}: Clicked (Assumed Success).')
                     await browser.close()
                     return True
 
             else:
                 print(f'[FAILED] {account_name}: Could not find "立即签到" button.')
+                # 调试：打印所有按钮文本
+                try:
+                    btns = page.locator("button")
+                    count = await btns.count()
+                    if count > 0:
+                        print(f'[DEBUG] Visible buttons: {[await btns.nth(i).text_content() for i in range(count)]}')
+                except: pass
+                
                 await browser.close()
                 return False
 
